@@ -245,6 +245,13 @@ if (!function_exists('bv_member_sd_money')) {
     }
 }
 
+if (!function_exists('bv_member_sd_usd_money')) {
+    function bv_member_sd_usd_money(float $amount): string
+    {
+        return 'USD ' . number_format($amount, 2);
+    }
+}
+
 if (!function_exists('bv_member_sd_pick_expr')) {
     function bv_member_sd_pick_expr(array $candidates, string $fallback): string
     {
@@ -777,6 +784,7 @@ $sellerDashboardStats = [
     'paid_waiting_pack' => 0,
     'offers_waiting_action' => 0,	
     'this_month_sales' => 0.0,
+	   'seller_balance' => 0.0,
    'this_month_refunded' => 0.0,
     'this_month_net_sales' => 0.0,	
     'currency' => 'USD',
@@ -1717,6 +1725,142 @@ if ($isSellerApproved && $userId > 0) {
         $_kpi_last_error = 'monthly_refunds: ' . $e->getMessage();
         error_log('member index seller refunds monthly load failed: ' . $e->getMessage());
     }
+
+ // --- BLOCK F2: Seller balance (estimated waiting for payout) ---
+    try {
+        $estimatedRevenue = 0.0;
+        $estimatedRefunds = 0.0;
+        $estimatedPayouts = 0.0;
+
+        if (bv_member_sd_table_exists($pdo, 'orders') && bv_member_sd_table_exists($pdo, 'order_items') && $_kpi_ownerWhere) {
+            $orderCols = bv_member_sd_columns($pdo, 'orders');
+            $orderItemCols = $_kpi_orderItemCols;
+            $listingJoin = $_kpi_hasListingJoin ? 'LEFT JOIN listings l ON l.id = oi.listing_id' : '';
+
+            $qtyCandidates = [];
+            if (!empty($orderItemCols['quantity'])) $qtyCandidates[] = 'oi.quantity';
+            if (!empty($orderItemCols['qty'])) $qtyCandidates[] = 'oi.qty';
+            $qtyExpr = bv_member_sd_pick_expr($qtyCandidates, '1');
+
+            $lineTotalCandidates = [];
+            if (!empty($orderItemCols['line_total'])) $lineTotalCandidates[] = 'oi.line_total';
+            if (!empty($orderItemCols['total_price'])) $lineTotalCandidates[] = 'oi.total_price';
+            if (!empty($orderItemCols['subtotal'])) $lineTotalCandidates[] = 'oi.subtotal';
+            $unitCandidates = [];
+            if (!empty($orderItemCols['unit_price'])) $unitCandidates[] = 'oi.unit_price';
+            if (!empty($orderItemCols['price'])) $unitCandidates[] = 'oi.price';
+            if ($unitCandidates) {
+                $lineTotalCandidates[] = '(COALESCE(' . implode(', ', $unitCandidates) . ', 0) * COALESCE(' . $qtyExpr . ', 1))';
+            }
+            $lineTotalExpr = bv_member_sd_pick_expr($lineTotalCandidates, '0');
+
+            $revenueSql = "
+                SELECT
+                    SUM(COALESCE({$lineTotalExpr}, 0)) AS revenue_total
+                FROM orders o
+                INNER JOIN order_items oi ON oi.order_id = o.id
+                {$listingJoin}
+                WHERE (" . implode(' OR ', $_kpi_ownerWhere) . ")
+            ";
+
+            if (!empty($orderCols['status'])) {
+                $revenueSql .= " AND LOWER(COALESCE(o.status, '')) NOT IN ('cancelled','canceled','failed','refunded')";
+            }
+            if (!empty($orderCols['payment_status'])) {
+                $revenueSql .= " AND LOWER(COALESCE(o.payment_status, '')) NOT IN ('failed','cancelled','canceled','refunded')";
+            } elseif (!empty($orderCols['payment_state'])) {
+                $revenueSql .= " AND LOWER(COALESCE(o.payment_state, '')) NOT IN ('failed','cancelled','canceled','refunded')";
+            }
+
+            $stmtRevenue = $pdo->query($revenueSql);
+            $estimatedRevenue = $stmtRevenue ? (float)($stmtRevenue->fetchColumn() ?: 0) : 0.0;
+        }
+
+        if (bv_member_sd_table_exists($pdo, 'order_refunds') && bv_member_sd_table_exists($pdo, 'order_refund_items') && bv_member_sd_table_exists($pdo, 'order_items')) {
+            $refundCols = bv_member_sd_columns($pdo, 'order_refunds');
+            $refundItemCols = bv_member_sd_columns($pdo, 'order_refund_items');
+            $orderItemCols = $_kpi_orderItemCols;
+
+            $riRefundExpr = '0';
+            foreach (['actual_refund_after_fee', 'seller_net_refund', 'net_refund_amount', 'approved_refund_amount', 'requested_refund_amount'] as $candidate) {
+                if (!empty($refundItemCols[$candidate])) {
+                    $riRefundExpr = 'ri.' . $candidate;
+                    break;
+                }
+            }
+
+            $hasRefundListingJoin = ($_kpi_listingExists && (!empty($refundItemCols['listing_id']) || !empty($orderItemCols['listing_id'])));
+            $listingJoin = $hasRefundListingJoin ? 'LEFT JOIN listings l ON l.id = COALESCE(ri.listing_id, oi.listing_id)' : '';
+            $refundOwnerWhere = [];
+            if (!empty($orderItemCols['seller_id'])) {
+                $refundOwnerWhere[] = 'oi.seller_id = ' . $sellerIdInt;
+            }
+            if ($hasRefundListingJoin && !empty($_kpi_listingCols['seller_id'])) {
+                $refundOwnerWhere[] = 'l.seller_id = ' . $sellerIdInt;
+            }
+
+            if ($refundOwnerWhere) {
+                $refundSql = "
+                    SELECT
+                        SUM(COALESCE({$riRefundExpr}, 0)) AS refunds_total
+                    FROM order_refunds r
+                    INNER JOIN order_refund_items ri ON ri.refund_id = r.id
+                    LEFT JOIN order_items oi ON oi.id = ri.order_item_id
+                    {$listingJoin}
+                    WHERE (" . implode(' OR ', $refundOwnerWhere) . ")
+                ";
+                if (!empty($refundCols['status'])) {
+                    $refundSql .= " AND LOWER(COALESCE(r.status, '')) IN ('refunded','partially_refunded','approved','processing')";
+                }
+
+                $stmtRefund = $pdo->query($refundSql);
+                $estimatedRefunds = $stmtRefund ? (float)($stmtRefund->fetchColumn() ?: 0) : 0.0;
+            }
+        }
+
+        $payoutTable = '';
+        if (bv_member_sd_table_exists($pdo, 'seller_payouts')) {
+            $payoutTable = 'seller_payouts';
+        } elseif (bv_member_sd_table_exists($pdo, 'payouts')) {
+            $payoutTable = 'payouts';
+        }
+
+        if ($payoutTable !== '') {
+            $payoutCols = bv_member_sd_columns($pdo, $payoutTable);
+            $payoutSellerCol = !empty($payoutCols['seller_id']) ? 'seller_id'
+                : (!empty($payoutCols['user_id']) ? 'user_id'
+                : (!empty($payoutCols['seller_user_id']) ? 'seller_user_id' : ''));
+            if ($payoutSellerCol !== '') {
+                $payoutAmountExpr = '0';
+                foreach (['amount', 'payout_amount', 'net_amount', 'paid_amount'] as $candidate) {
+                    if (!empty($payoutCols[$candidate])) {
+                        $payoutAmountExpr = '`' . $candidate . '`';
+                        break;
+                    }
+                }
+
+                $payoutSql = "
+                    SELECT
+                        SUM(COALESCE({$payoutAmountExpr}, 0)) AS payouts_total
+                    FROM `{$payoutTable}`
+                    WHERE `{$payoutSellerCol}` = :seller_id
+                ";
+                if (!empty($payoutCols['status'])) {
+                    $payoutSql .= " AND LOWER(COALESCE(`status`, '')) IN ('paid','completed','succeeded')";
+                }
+
+                $stmtPayout = $pdo->prepare($payoutSql);
+                $stmtPayout->execute([':seller_id' => $sellerIdInt]);
+                $estimatedPayouts = (float)($stmtPayout->fetchColumn() ?: 0);
+            }
+        }
+
+        $sellerDashboardStats['seller_balance'] = max(0, $estimatedRevenue - $estimatedRefunds - $estimatedPayouts);
+    } catch (Throwable $e) {
+        $sellerDashboardStats['seller_balance'] = 0.0;
+        error_log('member index seller balance load failed: ' . $e->getMessage());
+    }
+	
     // --- BLOCK G: Seller Ranking Snapshot ---
     // Reads from listing_ranking_scores joined with listings.
     // Uses $sellerId / $sellerIdInt already resolved above.
@@ -2346,6 +2490,7 @@ bv_member_page_begin('My Account | Bettavaro', 'Bettavaro member and seller dash
             <a class="stat-link" href="<?= bv_member_e($refundPage) ?>"><div class="stat-card"><strong><?= (int)$sellerDashboardStats['refund_processed'] ?></strong><span>Refund Processed</span></div></a>
             <a class="stat-link" href="<?= bv_member_e($offerPage) ?>"><div class="stat-card"><strong><?= (int)$sellerDashboardStats['open_offers'] ?></strong><span>Open Offers</span></div></a>
             <a class="stat-link" href="#seller-sales-summary"><div class="stat-card"><strong><?= bv_member_e(bv_member_sd_money((float)$sellerDashboardStats['this_month_sales'], (string)$sellerDashboardStats['currency'])) ?></strong><span>This Month Sales</span></div></a>
+			<a class="stat-link" href="#seller-sales-summary"><div class="stat-card"><strong><?= bv_member_e(bv_member_sd_usd_money((float)$sellerDashboardStats['seller_balance'])) ?></strong><span>Seller Balance</span><small class="muted">Estimated balance waiting for payout</small></div></a>
           </div>
 
           <div id="priority-alerts" class="mini-card" style="margin-bottom:14px;">
